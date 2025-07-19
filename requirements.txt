@@ -1,0 +1,8 @@
+streamlit
+openai
+azure-cognitiveservices-speech
+pandas
+python-dotenv
+PyMuPDF
+streamlit-webrtc
+requests
