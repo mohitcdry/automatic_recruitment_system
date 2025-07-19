@@ -4,17 +4,27 @@ from openai import AzureOpenAI
 import azure.cognitiveservices.speech as speechsdk
 import time
 import json
-import requests
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
-from utils import parse_pdf
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoTransformerBase
+from dotenv import load_dotenv
+import uuid
+import glob
+import os
+import time
+
+# --- 1. CONFIGURATION & INITIALIZATION ---
+
+# Load environment variables from .env file
+load_dotenv()
 
 
-# --- CONFIGURATION ---
 def get_azure_keys():
-    """Fetches Azure keys from environment variables."""
+    """
+    Fetches Azure keys from environment variables and correctly parses the endpoint.
+    """
     azure_speech_key = os.getenv("AZURE_SPEECH_API_KEY")
     azure_speech_region = os.getenv("AZURE_SPEECH_REGION")
     azure_openai_api_key = os.getenv("AZURE_OPENAI_API_KEY")
+
     azure_openai_endpoint_full = os.getenv("AZURE_OPENAI_ENDPOINT_GPT4O")
 
     if not all(
@@ -25,11 +35,21 @@ def get_azure_keys():
             azure_openai_endpoint_full,
         ]
     ):
-        st.error("One or more required Azure credentials are not set in the .env file.")
+        st.error(
+            "One or more required environment variables are missing from your .env file."
+        )
         st.stop()
 
-    azure_openai_endpoint = "https://" + azure_openai_endpoint_full.split("/")[2]
-    model_deployment_name = "gpt-4o"
+    try:
+        azure_openai_endpoint = (
+            "https://" + azure_openai_endpoint_full.split("/")[2] + "/"
+        )
+        model_deployment_name = azure_openai_endpoint_full.split("/")[5]
+    except IndexError:
+        st.error(
+            "The AZURE_OPENAI_ENDPOINT_GPT4O in your .env file appears to be malformed."
+        )
+        st.stop()
 
     return (
         azure_speech_key,
@@ -49,23 +69,28 @@ def get_azure_keys():
 ) = get_azure_keys()
 
 
-# --- AZURE & API SERVICES ---
+# --- 2. HELPER FUNCTIONS (SERVICES) ---
+
+
 @st.cache_resource
 def get_speech_synthesizer(speech_key, speech_region):
-    """Initializes the Azure Speech Synthesizer."""
+    """Initializes Azure Speech Synthesizer and returns speech_config separately."""
     speech_config = speechsdk.SpeechConfig(
         subscription=speech_key, region=speech_region
     )
-    speech_config.speech_synthesis_voice_name = "en-US-JennyNeural"
-    audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
-    return speechsdk.SpeechSynthesizer(
+    speech_config.speech_synthesis_voice_name = "en-US-AriaNeural"
+    audio_config = speechsdk.audio.AudioOutputConfig(filename="output.mp3")
+    synthesizer = speechsdk.SpeechSynthesizer(
         speech_config=speech_config, audio_config=audio_config
     )
+    return speech_config, synthesizer
 
 
-@st.cache_resource
+
 def get_speech_recognizer(speech_key, speech_region):
-    """Initializes the Azure Speech Recognizer."""
+    """Initializes Azure Speech Recognizer.
+    NOTE: This is NOT cached because it's stateful and causes issues with Streamlit's rerun model.
+    """
     speech_config = speechsdk.SpeechConfig(
         subscription=speech_key, region=speech_region
     )
@@ -76,34 +101,71 @@ def get_speech_recognizer(speech_key, speech_region):
     )
 
 
-def speak_text(synthesizer, text):
-    """Converts text to speech."""
+@st.cache_resource
+def get_openai_client(api_key, endpoint):
+    """Initializes Azure OpenAI Client."""
+    return AzureOpenAI(
+        api_key=api_key, api_version="2024-02-01", azure_endpoint=endpoint
+    )
+
+def speak_text(speech_config, text):
+    """Converts text to speech using Azure SDK and plays it."""
     if not text:
         return
-    # This function now only handles speaking, not writing to UI
-    synthesizer.speak_text_async(text).get()
+
+    # 🔁 Delete all previous .mp3 files (cleanup)
+    for file in glob.glob("output_*.mp3"):
+        try:
+            os.remove(file)
+        except Exception as e:
+            print(f"Failed to delete {file}: {e}")
+
+    # 🎤 Create new output file
+    unique_filename = f"output_{uuid.uuid4()}.mp3"
+    audio_config = speechsdk.audio.AudioOutputConfig(filename=unique_filename)
+    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+
+    result = synthesizer.speak_text_async(text).get()
+
+    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+        with open(unique_filename, "rb") as f:
+            st.audio(f.read(), format="audio/mp3", autoplay=True)
+
+        estimated_duration = len(text.split()) * 60 / 150
+        time.sleep(estimated_duration)
+
+        # 🗑️ Delete current file after playback
+        try:
+            os.remove(unique_filename)
+        except Exception as e:
+            print(f"Failed to delete {unique_filename}: {e}")
+    else:
+        st.error(f"Error synthesizing speech: {result.reason}")
 
 
-def recognize_from_microphone(recognizer):
-    """Captures audio from the microphone and converts it to text."""
-    st.info("Listening...")
+
+def recognize_from_microphone(recognizer, status_placeholder):
+    """Captures speech from microphone."""
+    status_placeholder.info("🎤 Listening... Please speak now.")
     result = recognizer.recognize_once_async().get()
+
     if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-        st.success(f"Heard: {result.text}")
+        status_placeholder.success(f"Heard: {result.text}")
         return result.text
     elif result.reason == speechsdk.ResultReason.NoMatch:
-        st.warning("No speech could be recognized. Please try again.")
+        status_placeholder.warning("No speech could be recognized.")
     elif result.reason == speechsdk.ResultReason.Canceled:
         st.error("Speech recognition canceled.")
-    return ""
+    return None
 
 
 def get_ai_response(client, model, conversation_history, response_format="text"):
-    """Gets a response from the AI model."""
+    """Fetches response from OpenAI."""
     response = client.chat.completions.create(
         model=model,
         messages=conversation_history,
         temperature=0.7,
+        max_tokens=150,
         response_format=(
             {"type": "json_object"} if response_format == "json" else {"type": "text"}
         ),
@@ -111,214 +173,257 @@ def get_ai_response(client, model, conversation_history, response_format="text")
     return response.choices[0].message.content
 
 
-@st.cache_data
-def get_resume_from_api(person_id):
-    """Fetches and parses a resume from the API."""
-    url = f"https://hackathonapi.aqore.com/PersonResume/DownloadResume?personId={person_id}"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        from io import BytesIO
+# --- 3. MAIN APPLICATION LOGIC ---
 
-        resume_file = BytesIO(response.content)
-        resume_file.name = f"{person_id}.pdf"
-        return parse_pdf(resume_file)
-    except requests.exceptions.RequestException as e:
-        st.error(f"Failed to fetch resume from API: {e}")
-        return None
-
-
-# --- UI & LOGIC ---
-st.set_page_config(page_title="AI HR Interview", page_icon="🎙️", layout="wide")
+st.set_page_config(page_title="AI HR Interviewer", page_icon="🎙️", layout="wide")
 st.title("🎙️ AI HR Screening Interview")
 
-# Initialize services
-speech_synthesizer = get_speech_synthesizer(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
-speech_recognizer = get_speech_recognizer(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
-openai_client = AzureOpenAI(
-    api_key=AZURE_OPENAI_API_KEY,
-    api_version="2024-02-01",
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-)
+# --- Initialize State & Services ---
+if "page_state" not in st.session_state:
+    st.session_state.page_state = "SETUP"
 
-# --- 1. INTERVIEW SETUP ---
-st.header("1. Interview Setup")
-setup_cols = st.columns(2)
-with setup_cols[0]:
-    # Option 1: Select from shortlisted candidates
-    if (
-        "shortlisted_df" in st.session_state
-        and not st.session_state.shortlisted_df.empty
+speech_config, speech_synthesizer = get_speech_synthesizer(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+openai_client = get_openai_client(AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT)
+
+
+# --- VIEW 1: SETUP ---
+if st.session_state.page_state == "SETUP":
+    st.header("Interview Setup")
+    st.write(
+        "Please upload the candidate's CV in PDF format to begin the interview. Camera and microphone access will be requested."
+    )
+
+    uploaded_cv = st.file_uploader("Upload CV (PDF)", type="pdf")
+    resume_text = None
+
+    if uploaded_cv:
+        with st.spinner("Processing CV..."):
+            from utils import parse_pdf
+
+            resume_text = parse_pdf(uploaded_cv)
+            st.success("CV processed successfully!")
+            st.text_area(
+                "Parsed CV Preview",
+                resume_text[:500] + "...",
+                height=150,
+                disabled=True,
+            )
+
+    st.session_state.candidate_name = "Candidate"
+
+    if st.button(
+        "▶️ Start Interview",
+        use_container_width=True,
+        type="primary",
+        disabled=(resume_text is None),
     ):
-        shortlisted_candidates = st.session_state.shortlisted_df
-        candidate_options = {
-            f"{row['name']} ({row['id']})": row["id"]
-            for _, row in shortlisted_candidates.iterrows()
-        }
-        selected_id = st.selectbox(
-            "Select a shortlisted candidate:",
-            options=list(candidate_options.values()),
-            format_func=lambda x: [
-                key for key, value in candidate_options.items() if value == x
-            ][0],
-        )
-        st.session_state.resume_text = (
-            get_resume_from_api(selected_id) if selected_id else None
-        )
-        st.session_state.candidate_name = (
-            shortlisted_candidates[shortlisted_candidates["id"] == selected_id][
-                "name"
-            ].iloc[0]
-            if selected_id
-            else "Candidate"
-        )
-    else:
-        st.info("No shortlisted candidates. Go to the ATS page to process CVs.")
+        st.session_state.resume_text = resume_text
+        st.session_state.page_state = "INTERVIEW"
+        st.session_state.interview_start_time = time.time()
+        st.session_state.messages = []
 
-with setup_cols[1]:
-    # Option 2: Manual CV upload
-    st.write("Or, upload a CV manually for a quick test:")
-    manual_cv = st.file_uploader("Upload CV for Interview", type="pdf")
-    if manual_cv:
-        st.session_state.resume_text = parse_pdf(manual_cv)
-        st.session_state.candidate_name = "Candidate"
+        system_prompt = f"""
+        You are a professional AI HR Recruiter interviewing {st.session_state.candidate_name}.
+        - Start with a warm greeting: "Hi, I'm zenople an AI interviewer. Let's start with a quick introduction about yourself."
+        - Ask CV-based questions (Work Experience > Skills). One at a time. Ask follow-ups if needed.
+        - Conclude politely after ~3 minutes.
+        Candidate's Resume:
+        {st.session_state.resume_text}
+        """
+        st.session_state.messages.append({"role": "system", "content": system_prompt})
 
-# --- 2. INTERVIEW ARENA ---
-if st.session_state.get("resume_text"):
-    st.header("2. Interview Arena")
+        with st.spinner("Preparing the first question..."):
+            initial_response = get_ai_response(
+                openai_client, MODEL_DEPLOYMENT_NAME, st.session_state.messages
+            )
+            st.session_state.messages.append(
+                {"role": "assistant", "content": initial_response}
+            )
+        st.rerun()
 
-    arena_cols = st.columns([0.6, 0.4])
-    with arena_cols[0]:
-        # Chat interface
+# --- VIEW 2: INTERVIEW ---
+elif st.session_state.page_state == "INTERVIEW":
+    st.header("Interview in Progress...")
+
+    # Add a button to reset the interview
+    if st.button("⬅️ Start Over"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+    col1, col2 = st.columns([0.6, 0.4])
+    with col1:
         st.subheader("Conversation")
         chat_container = st.container(height=400)
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-
         for message in st.session_state.messages:
-            with chat_container:
-                with st.chat_message(message["role"]):
-                    st.write(message["content"])
+            with chat_container.chat_message(message["role"]):
+                st.write(message["content"])
+        status_indicator = st.empty()
 
-    with arena_cols[1]:
-        # Camera feed
+    with col2:
         st.subheader("Camera Feed")
+
+        class VideoStreamTransformer(VideoTransformerBase):
+            def transform(self, frame):
+                return frame  # Pass-through frame
+
         webrtc_streamer(
             key="interview-cam",
-            mode=WebRtcMode.SENDONLY,  # Changed to SENDONLY to prevent audio loopback
+            mode=WebRtcMode.SENDONLY,
             rtc_configuration={
                 "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
             },
             media_stream_constraints={"video": True, "audio": True},
+            video_transformer_factory=VideoStreamTransformer,
         )
 
-    # Initialize interview state
-    if "interview_started" not in st.session_state:
-        st.session_state.interview_started = False
-    if "interview_finished" not in st.session_state:
-        st.session_state.interview_finished = False
+        total_time = time.time() - st.session_state.interview_start_time
+        st.metric(
+            "Total Interview Time",
+            f"{int(total_time // 60)}m {int(total_time % 60)}s / 5m",
+        )
 
-    # --- Interview Controls ---
-    if not st.session_state.interview_started:
-        if st.button("▶️ Start Interview", use_container_width=True):
-            st.session_state.interview_started = True
-            st.session_state.interview_finished = False
-            st.session_state.messages = []
+    interview_elapsed = time.time() - st.session_state.interview_start_time
+    if interview_elapsed > 150:  # 2.5 minutes
+        st.session_state.page_state = "REPORT"
+        st.warning("Interview time limit reached. Generating report.")
+        st.rerun()
 
-            system_prompt = f"""
-            You are an AI HR Recruiter conducting a screening interview with {st.session_state.candidate_name}.
-            Your task is to assess the candidate based on their resume.
-            
-            **Resume Context:**
-            {st.session_state.resume_text}
-            
-            **Instructions:**
-            1. Greet the candidate by name and ask for a brief self-introduction.
-            2. Ask questions based on the resume, prioritizing Experience, then Skills. Ask only one question at a time.
-            3. You can ask a maximum of 2 follow-up questions for a specific topic if the candidate's answer is unclear.
-            4. After 3-4 main questions, conclude the interview by saying "Thank you for your time. That's all the questions I have."
-            """
-            st.session_state.messages.append(
-                {"role": "system", "content": system_prompt}
-            )
+    # --- Speech Synthesis Logic ---
+    if "last_spoken" not in st.session_state:
+        st.session_state.last_spoken = None
 
-            with st.spinner("AI is preparing the first question..."):
-                initial_response = get_ai_response(
+    # Get the latest assistant message
+    assistant_messages = [
+        msg for msg in st.session_state.messages if msg["role"] == "assistant"
+    ]
+    if assistant_messages:  # Check if there are any assistant messages
+        latest_assistant_message = assistant_messages[-1]["content"]
+        # Speak only if the latest assistant message is different from the last spoken
+        if (
+            latest_assistant_message
+            and st.session_state.last_spoken != latest_assistant_message
+        ):
+            speak_text(speech_config, latest_assistant_message)
+            st.session_state.last_spoken = latest_assistant_message
+            # No rerun here to avoid interrupting the flow
+
+        # 🔁 Auto-start recording after AI speaks
+        speech_recognizer = get_speech_recognizer(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+        user_response = recognize_from_microphone(speech_recognizer, status_indicator)
+
+        if user_response:
+            st.session_state.messages.append({"role": "user", "content": user_response})
+
+            with st.spinner("AI is thinking..."):
+                ai_response = get_ai_response(
                     openai_client, MODEL_DEPLOYMENT_NAME, st.session_state.messages
                 )
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": initial_response}
+                    {"role": "assistant", "content": ai_response}
                 )
-                speak_text(speech_synthesizer, initial_response)
             st.rerun()
+        else:
+            status_indicator.warning("Could not hear you. Please try again.")
+    # --- User Interaction Logic ---
+    # if st.button("🎤 Record Your Answer", use_container_width=True, type="primary"):
+    #     # Get a fresh recognizer instance
+    #     speech_recognizer = get_speech_recognizer(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+    #     user_response = recognize_from_microphone(speech_recognizer, status_indicator)
 
-    if st.session_state.interview_started and not st.session_state.interview_finished:
-        if st.button("🎤 Record Answer", use_container_width=True):
-            user_response = recognize_from_microphone(speech_recognizer)
-            if user_response:
-                st.session_state.messages.append(
-                    {"role": "user", "content": user_response}
-                )
+    #     if user_response:
+    #         st.session_state.messages.append({"role": "user", "content": user_response})
 
-                with st.spinner("AI is thinking..."):
-                    ai_response = get_ai_response(
-                        openai_client, MODEL_DEPLOYMENT_NAME, st.session_state.messages
-                    )
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": ai_response}
-                    )
+    #         with st.spinner("AI is thinking..."):
+    #             ai_response = get_ai_response(
+    #                 openai_client, MODEL_DEPLOYMENT_NAME, st.session_state.messages
+    #             )
+    #             st.session_state.messages.append(
+    #                 {"role": "assistant", "content": ai_response}
+    #             )
+    #         # No immediate rerun; let the next cycle handle the new message
+    #         st.rerun()
+    #     else:
+    #         status_indicator.warning("Could not hear you. Please try again.")
 
-                    if "thank you for your time" in ai_response.lower():
-                        st.session_state.interview_finished = True
+    if st.button("🏁 End Interview and Generate Report"):
+        st.session_state.page_state = "REPORT"
+        st.rerun()
 
-                    speak_text(speech_synthesizer, ai_response)
-                st.rerun()
 
-    # --- 3. FINAL REPORT ---
-    if st.session_state.interview_finished:
-        st.header("3. Final Report")
-        st.success("Interview Concluded.")
-        if st.button("Generate Final Report", use_container_width=True):
-            with st.spinner("Generating final report..."):
-                conversation_transcript = "\n".join(
-                    [
-                        f"{msg['role']}: {msg['content']}"
-                        for msg in st.session_state.messages
-                        if msg["role"] != "system"
-                    ]
-                )
-                report_prompt = f"""
-                You are an AI HR Analyst. Based on the interview transcript with {st.session_state.candidate_name} and their resume, provide a final evaluation.
-                
-                **Resume:**
-                {st.session_state.resume_text}
-                
-                **Transcript:**
-                {conversation_transcript}
-                
-                **Instructions:**
-                Provide a final score out of 100, a concise review summary, and a final decision (Shortlisted / Hold / Reject).
-                Output your result in a single, valid JSON object with keys: "interview_score", "review", "status".
-                """
-                final_report_str = get_ai_response(
-                    openai_client,
-                    MODEL_DEPLOYMENT_NAME,
-                    [{"role": "system", "content": report_prompt}],
-                    response_format="json",
-                )
-                try:
-                    final_report = json.loads(final_report_str)
-                    st.subheader("Interview Evaluation")
-                    st.metric(
-                        "Interview Score",
-                        f"{final_report.get('interview_score', 'N/A')}/100",
-                    )
-                    st.text_area(
-                        "AI Review", final_report.get("review", "N/A"), height=150
-                    )
-                    st.info(f"Final Status: **{final_report.get('status', 'N/A')}**")
-                except json.JSONDecodeError:
-                    st.error("Failed to parse the final report from the AI.")
-                    st.text(final_report_str)
-else:
-    st.info("Select or upload a CV in the setup section to begin an interview.")
+# --- VIEW 3: FINAL REPORT ---
+elif st.session_state.page_state == "REPORT":
+    st.header("Interview Concluded")
+    st.balloons()
+
+    if "final_report" not in st.session_state:
+        with st.spinner("Generating final report..."):
+            conversation_transcript = "\n".join(
+                [
+                    f"{msg['role']}: {msg['content']}"
+                    for msg in st.session_state.messages
+                    if msg["role"] != "system"
+                ]
+            )
+            report_prompt = f"""
+            You are a senior HR Analyst. Based on the following interview transcript with {st.session_state.candidate_name}, provide a detailed evaluation.
+
+            Interview Transcript:
+            ---
+            {conversation_transcript}
+            ---
+
+            Your Task:
+            Provide the final evaluation based on the transcript. Give:
+            - Strengths: The candidate's key strengths.
+            - Weaknesses: Their potential weaknesses or areas for improvement.
+            - Interview Score: A score out of 100.
+            - Decision: A final decision ("Shortlisted", "Hold", or "Reject").
+            
+            Output your response as a single, valid JSON object with the keys: "strengths", "weaknesses", "interview_score", "status".
+            """
+            final_report_str = get_ai_response(
+                openai_client,
+                MODEL_DEPLOYMENT_NAME,
+                [{"role": "system", "content": report_prompt}],
+                response_format="json",
+            )
+            try:
+                st.session_state.final_report = json.loads(final_report_str)
+            except json.JSONDecodeError:
+                st.session_state.final_report = {"error": final_report_str}
+
+    report = st.session_state.final_report
+    if "error" in report:
+        st.text(report["error"])
+    else:
+        st.subheader("Interview Evaluation")
+        st.metric("Score", f"{report.get('interview_score', 'N/A')}/100")
+        st.info(f"Decision: {report.get('status', 'N/A')}")
+
+        # --- Strengths ---
+        st.subheader("Strengths")
+        strengths = report.get("strengths", ["N/A"])
+        if isinstance(strengths, list):
+            # Format list into markdown bullet points
+            strengths_md = "\n".join([f"- {s}" for s in strengths])
+            st.markdown(strengths_md)
+        else:
+            # Display as is if it's just a string
+            st.markdown(f"- {strengths}")
+
+        # --- Weaknesses / Areas for Improvement ---
+        st.subheader("Weaknesses / Areas for Improvement")
+        weaknesses = report.get("weaknesses", ["N/A"])
+        if isinstance(weaknesses, list):
+            # Format list into markdown bullet points
+            weaknesses_md = "\n".join([f"- {w}" for w in weaknesses])
+            st.markdown(weaknesses_md)
+        else:
+            # Display as is if it's just a string
+            st.markdown(f"- {weaknesses}")
+
+    if st.button("🔄 Start New Interview"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()

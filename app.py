@@ -6,7 +6,33 @@ from openai import AzureOpenAI
 from utils import parse_pdf, get_cv_score
 import concurrent.futures
 
+
 load_dotenv()
+
+# --- Global Configuration & Client Initialization ---
+
+# Get API keys from .env file
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT_FULL = os.getenv("AZURE_OPENAI_ENDPOINT_GPT4O_MINI")
+GMAIL_PASS = os.getenv("GMAIL_PASS")
+
+# Check for keys at the start
+if not all([AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT_FULL, GMAIL_PASS]):
+    st.error(
+        "One or more required environment variables (AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT_GPT4O_MINI, GMAIL_PASS) are not found. Please set them in your .env file."
+    )
+    st.stop()
+
+# The SDK needs the base endpoint, not the full deployment URL
+AZURE_OPENAI_ENDPOINT = "https://" + AZURE_OPENAI_ENDPOINT_FULL.split("/")[2]
+
+# Initialize the client ONCE, globally.
+CLIENT = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version="2024-02-01",
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+)
+MODEL_DEPLOYMENT_NAME = "gpt-4o-mini"
 
 
 def process_single_cv(file, client, job_description, model_deployment_name):
@@ -33,26 +59,7 @@ def main():
     st.title("AI-Powered Applicant Tracking System")
     st.write("Upload CVs and a job description to automatically shortlist candidates.")
 
-    # Get API keys from .env file
-    azure_openai_api_key = os.getenv("AZURE_OPENAI_API_KEY")
-    # Extract base endpoint from the full deployment URL
-    azure_openai_endpoint_full = os.getenv("AZURE_OPENAI_ENDPOINT_GPT4O_MINI")
-
-    if not (azure_openai_api_key and azure_openai_endpoint_full):
-        st.error(
-            "Azure OpenAI API key or endpoint is not found. Please set them in your .env file."
-        )
-        return
-
-    # The SDK needs the base endpoint, not the full deployment URL
-    azure_openai_endpoint = "https://" + azure_openai_endpoint_full.split("/")[2]
-
-    client = AzureOpenAI(
-        api_key=azure_openai_api_key,
-        api_version="2024-02-01",
-        azure_endpoint=azure_openai_endpoint,
-    )
-    model_deployment_name = "gpt-4o-mini"
+    # Client and model name are now accessed from the global scope, not redefined here.
 
     st.header("Configuration")
     job_description = st.text_area("Job Description", height=200)
@@ -68,14 +75,14 @@ def main():
             status_text = st.empty()
 
             # Increase max_workers for I/O-bound tasks and process parsing in the thread
-            with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 future_to_file = {
                     executor.submit(
                         process_single_cv,
                         file,
-                        client,
+                        CLIENT,  
                         job_description,
-                        model_deployment_name,
+                        MODEL_DEPLOYMENT_NAME,  
                     ): file
                     for file in uploaded_files
                 }
@@ -107,7 +114,6 @@ def main():
                     by="score", ascending=False
                 )
 
-                # Store shortlisted candidates in session state for other pages
                 st.session_state.shortlisted_df = shortlisted_df
 
                 st.success("CVs processed successfully!")
@@ -128,12 +134,17 @@ def main():
 
                 # Export to CSV
                 csv = shortlisted_df.to_csv(index=False)
-                st.download_button(
-                    label="Download Shortlisted Candidates as CSV",
-                    data=csv,
-                    file_name="shortlisted_candidates.csv",
-                    mime="text/csv",
-                )
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    st.download_button(
+                        label="Download Shortlisted Candidates as CSV",
+                        data=csv,
+                        file_name="shortlisted_candidates.csv",
+                        mime="text/csv",
+                    )
+                with col2:
+                    if st.button("📧 Compose Mail to Selected Candidates"):
+                        st.session_state.show_mail_form = True
 
                 # Display candidates by domain using expanders
                 st.header("Candidates by Domain")
@@ -153,6 +164,78 @@ def main():
         else:
             st.warning("Please upload CVs and provide a job description.")
 
+##bulk mail
+import smtplib
+from email.mime.text import MIMEText
+
+def generate_personalized_email(
+    client, model_deployment_name, candidate_name, job_title, interview_link
+):
+    prompt = (
+        f"Write a professional email to {candidate_name} informing them they are shortlisted for the position of {job_title}. "
+        f"Invite them to attend an AI-powered interview at this link: {interview_link}. "
+        "Keep the tone friendly and formal. Sign off as 'HR Team'."
+    )
+    response = client.chat.completions.create(
+        model=model_deployment_name,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200,
+        temperature=0.4,
+    )
+    return response.choices[0].message.content
+
+
+def send_bulk_email(emails, subjects, bodies, sender_email, sender_password):
+    smtp_server = "smtp.gmail.com"
+    smtp_port = 587
+    with smtplib.SMTP(smtp_server, smtp_port) as server:
+        server.starttls()
+        server.login(sender_email, sender_password)
+        for email, subject, body in zip(emails, subjects, bodies):
+            msg = MIMEText(body)
+            msg["Subject"] = subject
+            msg["From"] = sender_email
+            msg["To"] = email
+            server.sendmail(sender_email, email, msg.as_string())
+
+
+# Only show Compose Mail button if there are shortlisted candidates
+# --- Bulk Mail Section: Only show after shortlisting, at the bottom ---
+
+if "shortlisted_df" in st.session_state and not st.session_state.shortlisted_df.empty:
+    st.divider()
+    st.subheader("Bulk Email to Shortlisted Candidates")
+    if not st.session_state.get("show_mail_form"):
+        if st.button("📧 Compose Mail to Selected Candidates"):
+            st.session_state.show_mail_form = True
+
+    if st.session_state.get("show_mail_form"):
+        shortlisted_df = st.session_state.shortlisted_df
+        emails = shortlisted_df["email"].dropna().unique().tolist()
+        names = shortlisted_df["name"].fillna("Candidate").tolist()
+        job_title = st.session_state.get("job_title", "the position")
+        interview_link = "http://192.168.1.84:8502/"
+
+        st.info("Generating personalized emails using GPT-4o-mini...")
+
+        subjects = [f"Invitation: AI Interview for {job_title}"] * len(emails)
+        bodies = []
+        for name in names:
+            body = generate_personalized_email(
+                CLIENT, MODEL_DEPLOYMENT_NAME, name, job_title, interview_link
+            )
+            bodies.append(body)
+
+        sender_email = st.text_input(
+            "Sender Gmail address", value="www.michelchaudhary@gmail.com"
+        )
+        sender_password = st.text_input(
+            "Gmail App Password", type="password", value=GMAIL_PASS
+        )
+        if st.button("Send Bulk Email"):
+            send_bulk_email(emails, subjects, bodies, sender_email, sender_password)
+            st.success("Emails sent successfully!")
+            st.session_state.show_mail_form = False
 
 if __name__ == "__main__":
     main()
