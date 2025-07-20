@@ -252,14 +252,15 @@ elif st.session_state.page_state == "INTERVIEW":
             del st.session_state[key]
         st.rerun()
 
-    col1 = st.container()
-    with col1:
-        st.subheader("Conversation")
-        chat_container = st.container()
-        for message in st.session_state.messages:
-            with chat_container.chat_message(message["role"]):
-                st.write(message["content"])
-        status_indicator = st.empty()
+    st.subheader("Conversation")
+    # Create a scrollable container for the chat history
+    chat_container = st.container(height=400)
+    for message in st.session_state.messages:
+        with chat_container.chat_message(message["role"]):
+            st.write(message["content"])
+
+    # The status indicator should be outside the scrollable container
+    status_indicator = st.empty()
 
     webrtc_streamer(
         key="audio-stream",
@@ -290,11 +291,11 @@ elif st.session_state.page_state == "INTERVIEW":
     total_time = time.time() - st.session_state.interview_start_time
     st.metric(
             "Total Interview Time",
-            f"{int(total_time // 60)}m {int(total_time % 60)}s / 8m",
+            f"{int(total_time // 60)}m {int(total_time % 60)}s / 2m",
         )
 
     interview_elapsed = time.time() - st.session_state.interview_start_time
-    if interview_elapsed > 480:  # 10 minutes
+    if interview_elapsed > 120:  # 2 minutes
         st.session_state.page_state = "REPORT"
         st.warning("Interview time limit reached. Generating report.")
         st.rerun()
@@ -444,14 +445,34 @@ elif st.session_state.page_state == "REPORT":
         Weaknesses:
         {weaknesses_md if isinstance(weaknesses, list) else weaknesses}
         """
-        st.download_button(
-            label="📄 Export Report as Text",
-            data=report_text,
-            file_name=f"{st.session_state.candidate_name}_interview_report.txt",
-            mime="text/plain",
-        )
+        st.subheader("Next Steps")
+        try:
+            score = int(report.get("interview_score", 0))
+            if score > 80:
+                st.success(
+                    "✅ Recommendation: Directly Hire Candidate. The candidate shows exceptional promise."
+                )
+            elif 60 <= score <= 80:
+                st.info(
+                    "🤔 Recommendation: HR to Review and Decide. The candidate is promising but requires further evaluation."
+                )
+            else:
+                st.warning(
+                    "🔵 Recommendation: Send back to Talent Pool. The candidate may be a better fit for future roles."
+                )
+        except (ValueError, TypeError):
+            st.error("Could not determine next steps due to an invalid score format.")
 
-    if st.button("🔄 Start New Interview"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
+        col1, col_gap, col2 = st.columns([2, 0.2, 2])
+        with col1:
+            st.download_button(
+                label="📄 Export Report as Text",
+                data=report_text,
+                file_name=f"{st.session_state.candidate_name}_interview_report.txt",
+                mime="text/plain",
+            )
+        with col2:
+            if st.button("🔄 Start New Interview"):
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                st.rerun()
