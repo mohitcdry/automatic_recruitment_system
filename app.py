@@ -9,24 +9,21 @@ import concurrent.futures
 
 load_dotenv()
 
-# --- Global Configuration & Client Initialization ---
-
-# Get API keys from .env file
+# API keys from .env
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT_FULL = os.getenv("AZURE_OPENAI_ENDPOINT_GPT4O_MINI")
 GMAIL_PASS = os.getenv("GMAIL_PASS")
 
-# Check for keys at the start
+# key testing
 if not all([AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT_FULL, GMAIL_PASS]):
     st.error(
         "One or more required environment variables (AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT_GPT4O_MINI, GMAIL_PASS) are not found. Please set them in your .env file."
     )
     st.stop()
 
-# The SDK needs the base endpoint, not the full deployment URL
+# Sdk base endpoint
 AZURE_OPENAI_ENDPOINT = "https://" + AZURE_OPENAI_ENDPOINT_FULL.split("/")[2]
 
-# Initialize the client ONCE, globally.
 CLIENT = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
     api_version="2024-02-01",
@@ -48,7 +45,6 @@ def process_single_cv(file, client, job_description, model_deployment_name):
     if "error" not in score_data:
         score_data["id"] = os.path.splitext(file.name)[0]
     else:
-        # Include filename in error data for context
         score_data["filename"] = file.name
 
     return score_data
@@ -59,7 +55,6 @@ def main():
     st.title("AI-Powered Applicant Tracking System")
     st.write("Upload CVs and a job description to automatically shortlist candidates.")
 
-    # Client and model name are now accessed from the global scope, not redefined here.
 
     st.header("Configuration")
     job_description = st.text_area("Job Description", height=200)
@@ -74,7 +69,7 @@ def main():
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            # Increase max_workers for I/O-bound tasks and process parsing in the thread
+            # Parallel processing for faster data process with 8 max thread
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 future_to_file = {
                     executor.submit(

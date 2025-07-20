@@ -1,8 +1,6 @@
-import fitz  # PyMuPDF
+import fitz  
 from openai import AzureOpenAI
-import os
 import json
-import uuid
 
 
 def parse_pdf(file):
@@ -48,14 +46,6 @@ Provide your response as a single, valid JSON object with the following keys:
 - "domain": (string) The matched job domain.
 - "comment": (string) A one-line summary.
 
-Example:
-{
-  "name": "John Doe",
-  "email": "john.doe@example.com",
-  "score": 85,
-  "domain": "Information Technology",
-  "comment": "Strong candidate with relevant experience in cloud technologies."
-}
 """
 
     user_prompt = f"Resume:\n{resume_text}\n\nJob Description:\n{job_description}"

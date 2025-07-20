@@ -151,6 +151,7 @@ def recognize_from_microphone(recognizer, status_placeholder):
 
     if result.reason == speechsdk.ResultReason.RecognizedSpeech:
         status_placeholder.success(f"Heard: {result.text}")
+        time.sleep(2)
         return result.text
     elif result.reason == speechsdk.ResultReason.NoMatch:
         status_placeholder.warning("No speech could be recognized.")
@@ -251,40 +252,49 @@ elif st.session_state.page_state == "INTERVIEW":
             del st.session_state[key]
         st.rerun()
 
-    col1, col2 = st.columns([0.6, 0.4])
+    col1 = st.container()
     with col1:
         st.subheader("Conversation")
-        chat_container = st.container(height=400)
+        chat_container = st.container()
         for message in st.session_state.messages:
             with chat_container.chat_message(message["role"]):
                 st.write(message["content"])
         status_indicator = st.empty()
 
-    with col2:
-        st.subheader("Camera Feed")
+    webrtc_streamer(
+        key="audio-stream",
+        mode=WebRtcMode.SENDONLY,
+        rtc_configuration={
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        },
+        media_stream_constraints={"video": False, "audio": True},
+    )
 
-        class VideoStreamTransformer(VideoTransformerBase):
-            def transform(self, frame):
-                return frame  # Pass-through frame
+    # with col2:
+    #     st.subheader("Camera Feed")
 
-        webrtc_streamer(
-            key="interview-cam",
-            mode=WebRtcMode.SENDONLY,
-            rtc_configuration={
-                "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-            },
-            media_stream_constraints={"video": True, "audio": True},
-            video_transformer_factory=VideoStreamTransformer,
-        )
+    #     class VideoStreamTransformer(VideoTransformerBase):
+    #         def transform(self, frame):
+    #             return frame  # Pass-through frame
 
-        total_time = time.time() - st.session_state.interview_start_time
-        st.metric(
+    #     webrtc_streamer(
+    #         key="interview-cam",
+    #         mode=WebRtcMode.SENDONLY,
+    #         rtc_configuration={
+    #             "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    #         },
+    #         media_stream_constraints={"video": True, "audio": True},
+    #         video_transformer_factory=VideoStreamTransformer,
+    #     )
+
+    total_time = time.time() - st.session_state.interview_start_time
+    st.metric(
             "Total Interview Time",
-            f"{int(total_time // 60)}m {int(total_time % 60)}s / 5m",
+            f"{int(total_time // 60)}m {int(total_time % 60)}s / 8m",
         )
 
     interview_elapsed = time.time() - st.session_state.interview_start_time
-    if interview_elapsed > 150:  # 2.5 minutes
+    if interview_elapsed > 480:  # 10 minutes
         st.session_state.page_state = "REPORT"
         st.warning("Interview time limit reached. Generating report.")
         st.rerun()
@@ -350,11 +360,9 @@ elif st.session_state.page_state == "INTERVIEW":
         st.session_state.page_state = "REPORT"
         st.rerun()
 
-
 # --- VIEW 3: FINAL REPORT ---
 elif st.session_state.page_state == "REPORT":
     st.header("Interview Concluded")
-    st.balloons()
 
     if "final_report" not in st.session_state:
         with st.spinner("Generating final report..."):
@@ -401,27 +409,47 @@ elif st.session_state.page_state == "REPORT":
         st.metric("Score", f"{report.get('interview_score', 'N/A')}/100")
         st.info(f"Decision: {report.get('status', 'N/A')}")
 
-        # --- Strengths ---
+        #candidate_name
+        st.subheader(f"Candidate Name: {st.session_state.candidate_name}")
+
+        #  strengths 
         st.subheader("Strengths")
         strengths = report.get("strengths", ["N/A"])
         if isinstance(strengths, list):
-            # Format list into markdown bullet points
             strengths_md = "\n".join([f"- {s}" for s in strengths])
             st.markdown(strengths_md)
         else:
-            # Display as is if it's just a string
             st.markdown(f"- {strengths}")
 
-        # --- Weaknesses / Areas for Improvement ---
+        #  weaknesses and Areas for Improvement 
         st.subheader("Weaknesses / Areas for Improvement")
         weaknesses = report.get("weaknesses", ["N/A"])
         if isinstance(weaknesses, list):
-            # Format list into markdown bullet points
             weaknesses_md = "\n".join([f"- {w}" for w in weaknesses])
             st.markdown(weaknesses_md)
         else:
-            # Display as is if it's just a string
             st.markdown(f"- {weaknesses}")
+
+        # --- Export Report as Text File ---
+        report_text = f"""
+        Interview Evaluation Report
+        ===========================
+        Candidate Name: {st.session_state.candidate_name}
+        Score: {report.get('interview_score', 'N/A')}/100
+        Decision: {report.get('status', 'N/A')}
+
+        Strengths:
+        {strengths_md if isinstance(strengths, list) else strengths}
+
+        Weaknesses:
+        {weaknesses_md if isinstance(weaknesses, list) else weaknesses}
+        """
+        st.download_button(
+            label="📄 Export Report as Text",
+            data=report_text,
+            file_name=f"{st.session_state.candidate_name}_interview_report.txt",
+            mime="text/plain",
+        )
 
     if st.button("🔄 Start New Interview"):
         for key in list(st.session_state.keys()):
